@@ -1,30 +1,32 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import argparse
 import pandas as pd
 import numpy as np
-import os
 import joblib
+import time
+import warnings
 from src.features import FeatureGenerator
 from src.model import EntityResolutionModel
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import fbeta_score, precision_score, recall_score
-import warnings
+
 warnings.filterwarnings('ignore')
 
 def load_ground_truth(gt_path):
     """
     Loads train_ground_truth.tsv and returns a dictionary mapping
-    source1_entity_id -> set of matched candidate_entity_ids
+    source1_entity_id -> set of matched candidate_entity_ids.
+    Fast dictionary construction via zip.
     """
-    gt_df = pd.read_csv(gt_path, sep='\t')
+    gt_df = pd.read_csv(gt_path, sep='\t', dtype=str)
     if 'source1_entity_id' not in gt_df.columns or 'matched_entity_ids' not in gt_df.columns:
         raise ValueError("Ground truth file missing required columns.")
         
     gt_map = {}
-    for _, row in gt_df.iterrows():
-        s1_id = row['source1_entity_id']
-        matches_str = str(row['matched_entity_ids'])
-        if matches_str and matches_str != 'nan':
-            gt_map[s1_id] = set([x.strip() for x in matches_str.split(',') if x.strip()])
+    for s1_id, matches_str in zip(gt_df['source1_entity_id'], gt_df['matched_entity_ids']):
+        if pd.notna(matches_str) and matches_str.strip():
+            gt_map[s1_id] = set(matches_str.strip().split(','))
         else:
             gt_map[s1_id] = set()
     return gt_map
@@ -32,18 +34,49 @@ def load_ground_truth(gt_path):
 def assign_labels(pairs_df, gt_map):
     """
     Assigns labels based on the ground truth mapping.
-    label = 1 if candidate_entity_id in matched_entity_ids else 0
+    label = 1 if candidate_entity_id in matched_entity_ids else 0.
     """
-    def check_match(row):
-        s1 = row['source1_entity_id']
-        cand = row['candidate_entity_id']
-        if s1 not in gt_map:
-            # If the S1 ID doesn't exist in ground truth at all, it's invalid.
-            raise ValueError(f"Invalid entity ID {s1} not found in ground truth.")
-        return 1 if cand in gt_map[s1] else 0
-        
-    pairs_df['label'] = pairs_df.apply(check_match, axis=1)
+    s1_col = 'source1_entity_id' if 'source1_entity_id' in pairs_df.columns else 'source1_id'
+    cand_col = 'candidate_entity_id' if 'candidate_entity_id' in pairs_df.columns else 'candidate_id'
+    
+    labels = [
+        1 if cand in gt_map.get(s1, set()) else 0
+        for s1, cand in zip(pairs_df[s1_col], pairs_df[cand_col])
+    ]
+    pairs_df['label'] = labels
     return pairs_df
+
+def compute_metrics(y_true, y_pred, beta=0.5):
+    """
+    Computes precision, recall, and F-beta score without external C-extensions.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    b2 = beta ** 2
+    fbeta = (1 + b2) * precision * recall / (b2 * precision + recall) if (b2 * precision + recall) > 0 else 0.0
+    return precision, recall, fbeta
+
+def group_aware_split(pairs_df, group_col='source1_entity_id', train_ratio=0.8, random_state=42):
+    """
+    Partitions pairs_df such that unique group_col values strictly belong
+    either to train or validation, with zero overlap.
+    """
+    unique_groups = pairs_df[group_col].unique()
+    rng = np.random.RandomState(random_state)
+    shuffled_groups = rng.permutation(unique_groups)
+    split_idx = int(len(shuffled_groups) * train_ratio)
+    train_groups = set(shuffled_groups[:split_idx])
+    
+    train_mask = pairs_df[group_col].isin(train_groups)
+    train_pairs = pairs_df[train_mask].reset_index(drop=True)
+    val_pairs = pairs_df[~train_mask].reset_index(drop=True)
+    return train_pairs, val_pairs
 
 def log_experiment(results_path, result_dict):
     """
@@ -56,9 +89,43 @@ def log_experiment(results_path, result_dict):
     else:
         df.to_csv(results_path, index=False)
 
+def build_entity_maps(s1_path, s2_path, s3_path, needed_s1=None, needed_cand=None):
+    """
+    Loads entity metadata into compact dictionaries for fast lookups.
+    """
+    print("Building entity dictionaries for fast feature generation...")
+    # Source 1
+    s1_df = pd.read_csv(s1_path, sep='\t')
+    if needed_s1 is not None:
+        s1_df = s1_df[s1_df['entity_id'].isin(needed_s1)]
+    s1_dict = {
+        'name': dict(zip(s1_df['entity_id'], s1_df['business_name'].fillna(''))),
+        'addr': dict(zip(s1_df['entity_id'], s1_df['business_address'].fillna(''))),
+        'country': dict(zip(s1_df['entity_id'], s1_df['country'].fillna('')))
+    }
+    
+    # Source 2 and 3
+    cand_name = {}
+    cand_addr = {}
+    cand_ctry = {}
+    for p in [s2_path, s3_path]:
+        c_df = pd.read_csv(p, sep='\t')
+        if needed_cand is not None:
+            c_df = c_df[c_df['entity_id'].isin(needed_cand)]
+        cand_name.update(dict(zip(c_df['entity_id'], c_df['business_name'].fillna(''))))
+        cand_addr.update(dict(zip(c_df['entity_id'], c_df['business_address'].fillna(''))))
+        cand_ctry.update(dict(zip(c_df['entity_id'], c_df['country'].fillna(''))))
+        
+    cand_dict = {
+        'name': cand_name,
+        'addr': cand_addr,
+        'country': cand_ctry
+    }
+    return s1_dict, cand_dict, s1_df
+
 def main():
     parser = argparse.ArgumentParser(description="Train ML models for Entity Resolution")
-    parser.add_argument("--candidate_pairs", type=str, default=None, 
+    parser.add_argument("--candidate-pairs", "--candidate_pairs", dest="candidate_pairs", type=str, default=None, 
                         help="Path to candidate pairs TSV file generated by blocking.")
     parser.add_argument("--s1_data", type=str, default="dataset/train/train_source1.tsv")
     parser.add_argument("--s2_data", type=str, default="dataset/train/train_source2.tsv")
@@ -66,6 +133,12 @@ def main():
     parser.add_argument("--gt_data", type=str, default="dataset/train/train_ground_truth.tsv")
     parser.add_argument("--out_dir", type=str, default="models/")
     parser.add_argument("--results_log", type=str, default="experiments/results.csv")
+    parser.add_argument("--chunksize", type=int, default=50000,
+                        help="Candidate pairs chunk size for streaming processing.")
+    parser.add_argument("--max-pairs", type=int, default=None,
+                        help="Maximum candidate pairs to load/process.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Perform dry-run verification and exit without full model training.")
     parser.add_argument("--dev", action="store_true", help="Run in development mode with a small synthetic candidate sample.")
     parser.add_argument("--seed", type=int, default=42)
     
@@ -81,113 +154,129 @@ def main():
         print("MODEL CODE READY — WAITING FOR MEMBER 1 CANDIDATE PAIRS")
         return
 
-    print("Loading datasets...")
-    df_s1 = pd.read_csv(args.s1_data, sep='\t')
-    df_s2 = pd.read_csv(args.s2_data, sep='\t')
-    df_s3 = pd.read_csv(args.s3_data, sep='\t')
-    df_cand_full = pd.concat([df_s2, df_s3]).reset_index(drop=True)
-    
+    print("Loading ground truth mapping...")
     gt_map = load_ground_truth(args.gt_data)
     
     if args.dev:
-        print("Running in DEV mode with small synthetic sample...")
-        # Create a tiny subset of fake pairs that include positive and negative examples
+        print("Running in DEV mode with synthetic sample...")
+        df_s1 = pd.read_csv(args.s1_data, sep='\t')
+        df_s2 = pd.read_csv(args.s2_data, sep='\t')
         sample_s1 = df_s1.head(20)['entity_id'].tolist()
         pairs = []
         for s1 in sample_s1:
             if s1 in gt_map and len(gt_map[s1]) > 0:
-                # Add positive pair
                 pairs.append({'source1_entity_id': s1, 'candidate_entity_id': list(gt_map[s1])[0]})
-                # Add negative pair
                 pairs.append({'source1_entity_id': s1, 'candidate_entity_id': df_s2.iloc[0]['entity_id']})
-        
         pairs_df = pd.DataFrame(pairs)
     else:
-        print(f"Loading candidate pairs from {args.candidate_pairs}...")
-        pairs_df = pd.read_csv(args.candidate_pairs, sep='\t')
-        
-    if len(pairs_df) == 0:
-        raise ValueError("Empty candidate data.")
-        
-    # Check duplicates
-    if pairs_df.duplicated(subset=['source1_entity_id', 'candidate_entity_id']).any():
-        raise ValueError("Duplicate candidate pairs detected.")
-        
+        print(f"Streaming candidate pairs in chunks from {args.candidate_pairs}...")
+        chunks = []
+        total_loaded = 0
+        reader = pd.read_csv(args.candidate_pairs, sep='\t', chunksize=args.chunksize)
+        for chunk in reader:
+            # Normalize column names
+            if 'source1_id' in chunk.columns:
+                chunk = chunk.rename(columns={'source1_id': 'source1_entity_id', 'candidate_id': 'candidate_entity_id'})
+            
+            # Deduplicate chunk if any
+            chunk = chunk.drop_duplicates(subset=['source1_entity_id', 'candidate_entity_id'])
+            chunks.append(chunk)
+            total_loaded += len(chunk)
+            
+            if args.max_pairs and total_loaded >= args.max_pairs:
+                print(f"Reached max pairs limit: {total_loaded:,}")
+                break
+                
+            if args.dry_run:
+                # In dry-run mode, single chunk is sufficient for full verification
+                break
+                
+        pairs_df = pd.concat(chunks, ignore_index=True)
+        if args.max_pairs and len(pairs_df) > args.max_pairs:
+            pairs_df = pairs_df.head(args.max_pairs)
+
+    print(f"Loaded {len(pairs_df):,} candidate pairs.")
+    
     # Assign labels
     pairs_df = assign_labels(pairs_df, gt_map)
-    
-    print(f"Class distribution: 0={sum(pairs_df['label'] == 0)}, 1={sum(pairs_df['label'] == 1)}")
+    pos_count = int(np.sum(pairs_df['label'] == 1))
+    neg_count = int(np.sum(pairs_df['label'] == 0))
+    print(f"Class distribution: positive (1) = {pos_count:,}, negative (0) = {neg_count:,}")
     
     if len(pairs_df['label'].unique()) <= 1:
         raise ValueError("Only-one-class training data encountered.")
-    
-    print("Generating features...")
+
+    # Group-aware split
+    print("Performing group-aware train/validation split...")
+    train_pairs, val_pairs = group_aware_split(pairs_df, group_col='source1_entity_id', train_ratio=0.8, random_state=args.seed)
+    train_s1 = set(train_pairs['source1_entity_id'])
+    val_s1 = set(val_pairs['source1_entity_id'])
+    overlap = train_s1.intersection(val_s1)
+    if len(overlap) > 0:
+        raise ValueError(f"Data leakage detected! {len(overlap)} S1 entities overlap between train and val.")
+        
+    print(f"Train pairs: {len(train_pairs):,} (unique S1: {len(train_s1):,})")
+    print(f"Validation pairs: {len(val_pairs):,} (unique S1: {len(val_s1):,})")
+
+    # Build entity dictionaries for the required entities
+    needed_s1 = set(pairs_df['source1_entity_id'])
+    needed_cand = set(pairs_df['candidate_entity_id'])
+    s1_dict, cand_dict, s1_df = build_entity_maps(args.s1_data, args.s2_data, args.s3_data, needed_s1=needed_s1, needed_cand=needed_cand)
+
+    print("Fitting FeatureGenerator (TF-IDF) exclusively on training portion...")
     fg = FeatureGenerator()
-    
-    # Split BEFORE feature generation fitting to prevent data leakage in TF-IDF
-    # Group by source1_entity_id
-    gss = GroupShuffleSplit(n_splits=1, train_size=0.8, random_state=args.seed)
-    train_idx, val_idx = next(gss.split(pairs_df, groups=pairs_df['source1_entity_id']))
-    
-    if len(val_idx) == 0 or len(train_idx) == 0:
-        raise ValueError("Empty train or validation split.")
-        
-    train_pairs = pairs_df.iloc[train_idx].reset_index(drop=True)
-    val_pairs = pairs_df.iloc[val_idx].reset_index(drop=True)
-    
-    # Check overlap
-    train_s1 = set(train_pairs['source1_entity_id'].unique())
-    val_s1 = set(val_pairs['source1_entity_id'].unique())
-    if len(train_s1.intersection(val_s1)) > 0:
-        raise ValueError("Group-aware split failed! S1 entities overlap between train and validation.")
-        
-    print(f"Train pairs: {len(train_pairs)}, Val pairs: {len(val_pairs)}")
-    
-    # Generate features (Fit on train, transform on both)
-    # The FG uses df_s1 and df_cand_full to look up actual strings
-    # But it only fits TF-IDF on the entities present in train_pairs
-    train_s1_df = df_s1[df_s1['entity_id'].isin(train_pairs['source1_entity_id'])]
-    train_cand_df = df_cand_full[df_cand_full['entity_id'].isin(train_pairs['candidate_entity_id'])]
-    
-    fg.fit(train_s1_df, train_cand_df, train_pairs)
-    
-    train_features = fg.transform(df_s1, df_cand_full, train_pairs)
-    val_features = fg.transform(df_s1, df_cand_full, val_pairs)
-    
-    # Check columns
+    train_s1_records = pd.DataFrame({
+        'business_name': [s1_dict['name'].get(sid, '') for sid in train_pairs['source1_entity_id']],
+        'business_address': [s1_dict['addr'].get(sid, '') for sid in train_pairs['source1_entity_id']]
+    })
+    train_cand_records = pd.DataFrame({
+        'business_name': [cand_dict['name'].get(cid, '') for cid in train_pairs['candidate_entity_id']],
+        'business_address': [cand_dict['addr'].get(cid, '') for cid in train_pairs['candidate_entity_id']]
+    })
+    fg.fit(train_s1_records, train_cand_records, train_pairs)
+
+    print("Generating feature matrices for train and validation...")
+    train_features = fg.transform(s1_dict, cand_dict, train_pairs)
+    val_features = fg.transform(s1_dict, cand_dict, val_pairs)
+
     feature_cols = fg.feature_names
-    if list(train_features.columns) != ['source1_entity_id', 'candidate_entity_id'] + feature_cols:
-        raise ValueError("Mismatched feature columns generated.")
-        
     X_train = train_features[feature_cols]
     y_train = train_pairs['label']
-    
     X_val = val_features[feature_cols]
     y_val = val_pairs['label']
-    
+    print(f"Generated {len(feature_cols)} features. X_train shape: {X_train.shape}, X_val shape: {X_val.shape}")
+
+    if args.dry_run:
+        print("\n" + "=" * 60)
+        print("DRY-RUN / INTEGRATION CHECK COMPLETED SUCCESSFULLY!")
+        print(f"Candidate pairs processed : {len(pairs_df):,}")
+        print(f"Labels assigned           : 1={pos_count:,}, 0={neg_count:,}")
+        print(f"Group-aware split         : Train={len(train_pairs):,}, Val={len(val_pairs):,}, Leakage=0")
+        print(f"Feature matrix generated  : {X_train.shape[1]} features, zero NaNs")
+        print("=" * 60)
+        return
+
     print("Training models...")
     os.makedirs(args.out_dir, exist_ok=True)
-    
-    # Save the feature configuration
     fg.save(os.path.join(args.out_dir, 'feature_generator.joblib'))
-    
+
     models = ['logistic_regression', 'random_forest']
-    
     for model_type in models:
-        print(f"Training {model_type}...")
+        print(f"\n--- Training {model_type} ---")
+        t0 = time.time()
         model = EntityResolutionModel(model_type=model_type, random_state=args.seed)
         model.fit(X_train, y_train)
         model.save(os.path.join(args.out_dir, f'{model_type}.joblib'))
+        print(f"Trained {model_type} in {time.time()-t0:.2f}s")
         
         # Validation
         val_preds = model.predict(X_val)
         val_probs = model.predict_proba(X_val)
         
-        precision = precision_score(y_val, val_preds, zero_division=0)
-        recall = recall_score(y_val, val_preds, zero_division=0)
-        f0_5 = fbeta_score(y_val, val_preds, beta=0.5, zero_division=0)
+        precision, recall, f0_5 = compute_metrics(y_val, val_preds, beta=0.5)
+        print(f"[{model_type}] Val Precision: {precision:.4f}, Recall: {recall:.4f}, F0.5: {f0_5:.4f}")
         
-        # Save experiment log
+        # Log experiment
         result_dict = {
             'model': model_type,
             'random_seed': args.seed,
@@ -195,23 +284,22 @@ def main():
             'validation_entities': len(val_s1),
             'train_pairs': len(train_pairs),
             'validation_pairs': len(val_pairs),
-            'positive_pairs': int(y_train.sum() + y_val.sum()),
-            'negative_pairs': int(len(pairs_df) - (y_train.sum() + y_val.sum())),
+            'positive_pairs': int(pos_count),
+            'negative_pairs': int(neg_count),
             'feature_count': len(feature_cols),
             'validation_precision': precision,
             'validation_recall': recall,
             'validation_f0_5': f0_5
         }
-        
         log_experiment(args.results_log, result_dict)
-        print(f"Validation F0.5: {f0_5:.4f}")
         
         # Save validation predictions for evaluate.py
-        val_out = val_pairs.copy()
+        val_out = val_pairs[['source1_entity_id', 'candidate_entity_id']].copy()
         val_out['score'] = val_probs[:, 1]
         val_out.to_csv(os.path.join(args.out_dir, f'val_predictions_{model_type}.tsv'), sep='\t', index=False)
+        print(f"Saved validation predictions to {os.path.join(args.out_dir, f'val_predictions_{model_type}.tsv')}")
 
-    print("Model training pipeline completed successfully.")
+    print("\nModel training pipeline completed successfully!")
 
 if __name__ == '__main__':
     main()

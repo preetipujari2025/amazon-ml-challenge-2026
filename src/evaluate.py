@@ -1,6 +1,9 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import pandas as pd
 import numpy as np
-import os
 import json
 import warnings
 import unittest
@@ -247,28 +250,44 @@ class TestEvaluationModule(unittest.TestCase):
         self.assertEqual(best_th, 0.8) # Should pick higher threshold yielding best score
 
 if __name__ == '__main__':
-    # Run tests
-    print("Running Unit Tests...")
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestEvaluationModule)
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    
-    if result.wasSuccessful():
-        print("\nAll tests passed successfully.")
-        
-        print("\nRunning a small deterministic example...")
-        gt_df = pd.DataFrame({
-            'source1_entity_id': ['E1', 'E2', 'E3'],
-            'matched_entity_ids': ['M1', 'M2,M3', '']
-        })
-        pred_df = pd.DataFrame({
-            'source1_entity_id': ['E1', 'E2', 'E2', 'E3'],
-            'candidate_entity_id': ['M1', 'M2', 'M3', 'M4'],
-            'score': [0.95, 0.88, 0.45, 0.60]
-        })
-        best_th, best_f05 = sweep_thresholds(pred_df, gt_df)
-        print(f"Calculated Best Threshold: {best_th}")
-        print(f"Calculated Best F0.5: {best_f05:.4f}")
-        
-        print("\nEVALUATION CODE READY — WAITING FOR REAL CANDIDATE PAIRS")
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate Entity Resolution Predictions")
+    parser.add_argument("--predictions", type=str, default="models/val_predictions_logistic_regression.tsv",
+                        help="Path to validation predictions TSV.")
+    parser.add_argument("--gt_data", type=str, default="dataset/train/train_ground_truth.tsv",
+                        help="Path to ground truth TSV.")
+    parser.add_argument("--out_csv", type=str, default="experiments/threshold_results.csv",
+                        help="Path to threshold sweep output CSV.")
+    parser.add_argument("--out_json", type=str, default="models/threshold.json",
+                        help="Path to best threshold output JSON.")
+    parser.add_argument("--test", action="store_true", help="Run unit tests instead of evaluation.")
+    args = parser.parse_args()
+
+    if args.test:
+        print("Running Unit Tests...")
+        suite = unittest.TestLoader().loadTestsFromTestCase(TestEvaluationModule)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        if not result.wasSuccessful():
+            sys.exit(1)
     else:
-        print("\nTests failed! Please fix issues before deploying.")
+        if not os.path.exists(args.predictions):
+            print(f"Predictions file not found: {args.predictions}")
+            print("Run python src/train.py first to generate predictions.")
+            exit(1)
+            
+        print(f"Loading predictions from {args.predictions}...")
+        pred_df = pd.read_csv(args.predictions, sep='\t')
+        print(f"Loading ground truth from {args.gt_data}...")
+        gt_df = pd.read_csv(args.gt_data, sep='\t', dtype=str)
+        
+        # Filter ground truth to entities present in predictions to evaluate fairly
+        pred_s1 = set(pred_df['source1_entity_id'])
+        gt_sub = gt_df[gt_df['source1_entity_id'].isin(pred_s1)].reset_index(drop=True)
+        print(f"Evaluating {len(pred_df):,} predictions for {len(gt_sub):,} validation S1 entities...")
+        
+        best_th, best_f05 = sweep_thresholds(pred_df, gt_sub, out_csv=args.out_csv, out_json=args.out_json)
+        print(f"\nEvaluation Results:")
+        print(f"  Best Threshold: {best_th:.2f}")
+        print(f"  Best Macro F0.5: {best_f05:.4f}")
+        print(f"  Results saved to: {args.out_csv} and {args.out_json}")
+

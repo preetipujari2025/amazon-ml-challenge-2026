@@ -3,7 +3,7 @@ import numpy as np
 import re
 from rapidfuzz import fuzz, distance
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+# Note: cosine similarity is computed directly via sparse matrix dot product
 import joblib
 import os
 import warnings
@@ -88,32 +88,47 @@ class FeatureGenerator:
     def transform(self, df_s1, df_cand, pairs):
         """
         Generates features for the given pairs.
-        df_s1: DataFrame of Source 1 records (must have entity_id)
-        df_cand: DataFrame of Candidate records (must have entity_id)
+        df_s1: DataFrame or dict of Source 1 records
+        df_cand: DataFrame or dict of Candidate records (Source 2/3)
         pairs: DataFrame with columns ['source1_entity_id', 'candidate_entity_id']
+               or ['source1_id', 'candidate_id']
         """
         if not self.is_fitted:
             raise ValueError("FeatureGenerator must be fitted before calling transform.")
 
-        # Ensure entity_id is the index for fast lookups
-        df_s1 = df_s1.set_index('entity_id')
-        df_cand = df_cand.set_index('entity_id')
+        s1_col = 'source1_entity_id' if 'source1_entity_id' in pairs.columns else 'source1_id'
+        cand_col = 'candidate_entity_id' if 'candidate_entity_id' in pairs.columns else 'candidate_id'
+        s1_ids = pairs[s1_col].values
+        cand_ids = pairs[cand_col].values
 
-        features = []
-        
-        # Batch TF-IDF transform is more efficient, but we need aligned lists of texts for cosine sim
-        s1_ids = pairs['source1_entity_id'].values
-        cand_ids = pairs['candidate_entity_id'].values
-        
-        # Get raw data
-        s1_names = [self._safe_str(df_s1.loc[idx, 'business_name']) if idx in df_s1.index else "" for idx in s1_ids]
-        cand_names = [self._safe_str(df_cand.loc[idx, 'business_name']) if idx in df_cand.index else "" for idx in cand_ids]
-        
-        s1_addrs = [self._safe_str(df_s1.loc[idx, 'business_address']) if idx in df_s1.index else "" for idx in s1_ids]
-        cand_addrs = [self._safe_str(df_cand.loc[idx, 'business_address']) if idx in df_cand.index else "" for idx in cand_ids]
-        
-        s1_countries = [self._safe_str(df_s1.loc[idx, 'country']) if idx in df_s1.index else "" for idx in s1_ids]
-        cand_countries = [self._safe_str(df_cand.loc[idx, 'country']) if idx in df_cand.index else "" for idx in cand_ids]
+        if isinstance(df_s1, dict):
+            s1_name_map = df_s1.get('name', {})
+            s1_addr_map = df_s1.get('addr', {})
+            s1_ctry_map = df_s1.get('country', {})
+        else:
+            if 'entity_id' in df_s1.columns:
+                df_s1 = df_s1.set_index('entity_id')
+            s1_name_map = df_s1['business_name'].to_dict()
+            s1_addr_map = df_s1['business_address'].to_dict()
+            s1_ctry_map = df_s1['country'].to_dict()
+
+        if isinstance(df_cand, dict):
+            cand_name_map = df_cand.get('name', {})
+            cand_addr_map = df_cand.get('addr', {})
+            cand_ctry_map = df_cand.get('country', {})
+        else:
+            if 'entity_id' in df_cand.columns:
+                df_cand = df_cand.set_index('entity_id')
+            cand_name_map = df_cand['business_name'].to_dict()
+            cand_addr_map = df_cand['business_address'].to_dict()
+            cand_ctry_map = df_cand['country'].to_dict()
+
+        s1_names = [self._safe_str(s1_name_map.get(idx, "")) for idx in s1_ids]
+        cand_names = [self._safe_str(cand_name_map.get(idx, "")) for idx in cand_ids]
+        s1_addrs = [self._safe_str(s1_addr_map.get(idx, "")) for idx in s1_ids]
+        cand_addrs = [self._safe_str(cand_addr_map.get(idx, "")) for idx in cand_ids]
+        s1_countries = [self._safe_str(s1_ctry_map.get(idx, "")) for idx in s1_ids]
+        cand_countries = [self._safe_str(cand_ctry_map.get(idx, "")) for idx in cand_ids]
         
         # Normalize
         s1_names_norm = [self._normalize_string(n) for n in s1_names]
@@ -131,6 +146,7 @@ class FeatureGenerator:
         addr_tfidf_cand = self.address_vectorizer.transform(cand_addrs_norm)
         addr_cosine_sims = np.asarray(addr_tfidf_s1.multiply(addr_tfidf_cand).sum(axis=1)).flatten()
 
+        features = []
         for i in range(len(pairs)):
             row_features = []
             

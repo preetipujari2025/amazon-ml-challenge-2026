@@ -1,6 +1,9 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import pandas as pd
 import numpy as np
-import os
 import re
 import unittest
 from rapidfuzz import fuzz
@@ -215,38 +218,85 @@ class TestErrorAnalysis(unittest.TestCase):
         self.assertEqual(categorize_false_negative(row), 'missing_pin')
 
 if __name__ == '__main__':
-    print("Running Error Analysis Unit Tests...")
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestErrorAnalysis)
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    import argparse
+    import json
+    import sys
     
-    if result.wasSuccessful():
-        print("\nAll tests passed successfully.")
-        
-        # Internal test fixture
-        print("\nRunning a small deterministic example...")
-        preds = pd.DataFrame({
-            'source1_entity_id': ['S1', 'S2', 'S3'],
-            'candidate_entity_id': ['C1', 'C2', 'C3'],
-            'score': [0.9, 0.2, 0.8],
-            'prediction': [1, 0, 1],
-            'ground_truth_label': [0, 1, 1]
-        })
-        s1 = pd.DataFrame({
-            'entity_id': ['S1', 'S2', 'S3'],
-            'business_name': ['Test Inc', 'Company LLC', 'Amazon'],
-            'business_address': ['123 Way 12345', 'Road', 'Seattle'],
-            'country': ['US', 'US', 'US']
-        })
-        cand = pd.DataFrame({
-            'entity_id': ['C1', 'C2', 'C3'],
-            'business_name': ['Test Inc', '', 'Amazon'],
-            'business_address': ['123 Way 12345', 'Road', 'Seattle'],
-            'country': ['UK', 'US', 'US']
-        })
-        
-        summary = run_error_analysis(preds, s1, cand, out_txt="experiments/test_error_analysis.txt", out_tsv="experiments/test_error_cases.tsv")
-        print("\n" + summary)
-        
-        print("\nERROR ANALYSIS CODE READY — WAITING FOR REAL VALIDATION DATA")
+    parser = argparse.ArgumentParser(description="Run Error Analysis on Entity Resolution Predictions")
+    parser.add_argument("--predictions", type=str, default="models/val_predictions_logistic_regression.tsv",
+                        help="Path to validation predictions TSV.")
+    parser.add_argument("--threshold_json", type=str, default="models/threshold.json",
+                        help="Path to optimal threshold JSON.")
+    parser.add_argument("--gt_data", type=str, default="dataset/train/train_ground_truth.tsv",
+                        help="Path to ground truth TSV.")
+    parser.add_argument("--s1_data", type=str, default="dataset/train/train_source1.tsv")
+    parser.add_argument("--s2_data", type=str, default="dataset/train/train_source2.tsv")
+    parser.add_argument("--s3_data", type=str, default="dataset/train/train_source3.tsv")
+    parser.add_argument("--out_txt", type=str, default="experiments/error_analysis.txt",
+                        help="Output path for summary report.")
+    parser.add_argument("--out_tsv", type=str, default="experiments/error_cases.tsv",
+                        help="Output path for detailed error cases.")
+    parser.add_argument("--test", action="store_true", help="Run unit tests instead of error analysis.")
+    args = parser.parse_args()
+
+    if args.test:
+        print("Running Error Analysis Unit Tests...")
+        suite = unittest.TestLoader().loadTestsFromTestCase(TestErrorAnalysis)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        if not result.wasSuccessful():
+            sys.exit(1)
     else:
-        print("\nTests failed!")
+        if not os.path.exists(args.predictions):
+            print(f"Predictions file not found: {args.predictions}")
+            sys.exit(1)
+            
+        print(f"Loading predictions from {args.predictions}...")
+        pred_df = pd.read_csv(args.predictions, sep='\t')
+        
+        # Determine threshold
+        threshold = 0.5
+        if os.path.exists(args.threshold_json):
+            with open(args.threshold_json, 'r') as f:
+                th_data = json.load(f)
+                threshold = th_data.get('threshold', 0.5)
+            print(f"Using threshold {threshold:.2f} from {args.threshold_json}")
+        else:
+            print(f"Threshold file not found; defaulting to {threshold:.2f}")
+            
+        pred_df['prediction'] = (pred_df['score'] >= threshold).astype(int)
+        
+        # Load ground truth
+        print(f"Loading ground truth from {args.gt_data}...")
+        gt_df = pd.read_csv(args.gt_data, sep='\t', dtype=str)
+        gt_map = {}
+        for s1, m in zip(gt_df['source1_entity_id'], gt_df['matched_entity_ids']):
+            if pd.notna(m) and m.strip():
+                gt_map[s1] = set(m.strip().split(','))
+            else:
+                gt_map[s1] = set()
+                
+        pred_df['ground_truth_label'] = [
+            1 if cand in gt_map.get(s1, set()) else 0
+            for s1, cand in zip(pred_df['source1_entity_id'], pred_df['candidate_entity_id'])
+        ]
+        
+        # Load metadata for involved entities
+        needed_s1 = set(pred_df['source1_entity_id'])
+        needed_cand = set(pred_df['candidate_entity_id'])
+        
+        print("Loading metadata for error analysis entities...")
+        s1_df = pd.read_csv(args.s1_data, sep='\t')
+        s1_df = s1_df[s1_df['entity_id'].isin(needed_s1)].reset_index(drop=True)
+        
+        cand_list = []
+        for p in [args.s2_data, args.s3_data]:
+            df_c = pd.read_csv(p, sep='\t')
+            df_c = df_c[df_c['entity_id'].isin(needed_cand)]
+            cand_list.append(df_c)
+        cand_df = pd.concat(cand_list, ignore_index=True)
+        
+        print("Running error analysis...")
+        summary = run_error_analysis(pred_df, s1_df, cand_df, out_txt=args.out_txt, out_tsv=args.out_tsv)
+        print("\n" + summary)
+        print(f"\nError analysis completed. Outputs: {args.out_txt}, {args.out_tsv}")
+
