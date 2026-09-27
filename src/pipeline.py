@@ -1,23 +1,24 @@
 """End-to-End Integration Pipeline Harness for Member 3.
 
 Connects:
-1. Member 1 Module: Candidate Generation / Blocking
+1. Member 1 Module: Candidate Generation / Blocking (src.preprocessing.blocking)
 2. Member 3 Sub-pipeline: Saves output/candidate_pairs.tsv
-3. Member 2 Module: Matching Model Inference
+3. Member 2 Module / Adapter: Matching Model Inference (Member2MatchingModelAdapter)
 4. Member 3 Sub-pipeline: Formats output/matching_results.tsv and validates rules
+
+Supports command-line execution for inference and training setup.
 """
 
+import argparse
 import os
+import sys
 from typing import Dict, List, Optional, Any
 from src.interfaces import CandidateGeneratorProtocol, MatchingModelProtocol
 from src.submission import generate_submission_outputs, run_official_validator
 
 
 class PlaceholderCandidateGenerator:
-    """Integration Placeholder for Member 1's Candidate Generator.
-
-    Member 1 will replace this placeholder with their actual CandidateGenerator class.
-    """
+    """Fallback Placeholder for Member 1's Candidate Generator."""
 
     def generate_candidates(
         self,
@@ -25,17 +26,13 @@ class PlaceholderCandidateGenerator:
         s2_data: Any,
         s3_data: Any
     ) -> Dict[str, List[str]]:
-        """Mock implementation: returns a basic candidate set for integration testing."""
-        print("[MEMBER 1 PLACEHOLDER] Running candidate generation...")
-        # In actual code, Member 1 will implement TF-IDF / Blocking logic here
+        """Mock implementation: returns empty candidate set."""
+        print("[MEMBER 1 PLACEHOLDER] Running fallback candidate generation...")
         return {}
 
 
 class PlaceholderMatchingModel:
-    """Integration Placeholder for Member 2's Matching Model.
-
-    Member 2 will replace this placeholder with their actual MatchingModel class.
-    """
+    """Fallback Placeholder for Member 2's Matching Model."""
 
     def predict_matches(
         self,
@@ -44,9 +41,8 @@ class PlaceholderMatchingModel:
         s2_data: Any,
         s3_data: Any
     ) -> Dict[str, List[str]]:
-        """Mock implementation: returns match predictions for candidates."""
-        print("[MEMBER 2 PLACEHOLDER] Running matching model scoring...")
-        # In actual code, Member 2 will run feature engineering & model scoring here
+        """Mock implementation: returns empty match predictions."""
+        print("[MEMBER 2 PLACEHOLDER] Running fallback matching model scoring...")
         return {}
 
 
@@ -72,7 +68,12 @@ def run_pipeline(
         Dict of paths to generated output files.
     """
     if candidate_generator is None:
-        candidate_generator = PlaceholderCandidateGenerator()
+        try:
+            from src.adapters import Member1CandidateGeneratorAdapter
+            candidate_generator = Member1CandidateGeneratorAdapter()
+        except ImportError:
+            candidate_generator = PlaceholderCandidateGenerator()
+
     if matching_model is None:
         matching_model = PlaceholderMatchingModel()
 
@@ -108,3 +109,92 @@ def run_pipeline(
             print("SUCCESS: Output files passed validation!")
 
     return output_files
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Amazon ML Challenge 2026 — End-to-End Pipeline Harness (Member 3)"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["inference", "train"],
+        default="inference",
+        help="Pipeline mode: 'inference' to generate outputs, 'train' to fit models."
+    )
+    parser.add_argument(
+        "--test-dir",
+        default="dataset/test",
+        help="Path to folder containing test_source1/2/3.tsv"
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="Path to folder for saving generated submission TSV files"
+    )
+    parser.add_argument(
+        "--model-dir",
+        default="models",
+        help="Path to folder containing trained model artifacts"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Decision threshold for matching probabilities (overrides threshold.json)"
+    )
+    parser.add_argument(
+        "--check-ids",
+        action="store_true",
+        help="Enable ID existence check in validator against test_source2/3.tsv"
+    )
+
+    args = parser.parse_args()
+
+    if args.mode == "inference":
+        # Candidate Generator (Member 1)
+        try:
+            from src.adapters import Member1CandidateGeneratorAdapter
+            candidate_gen = Member1CandidateGeneratorAdapter()
+            print("[INFO] Using Member 1 Candidate Generator Adapter.")
+        except ImportError:
+            print("[INFO] Member 1 Candidate Generator Adapter not available. Using Placeholder.")
+            candidate_gen = PlaceholderCandidateGenerator()
+
+        # Matching Model Adapter (Member 2)
+        fg_path = os.path.join(args.model_dir, "feature_generator.joblib")
+        model_path = os.path.join(args.model_dir, "logistic_regression.joblib")
+        threshold_path = os.path.join(args.model_dir, "threshold.json")
+
+        if not os.path.exists(model_path):
+            model_path = os.path.join(args.model_dir, "random_forest.joblib")
+
+        if os.path.exists(fg_path) and os.path.exists(model_path):
+            from src.adapters import Member2MatchingModelAdapter
+            th = args.threshold if args.threshold is not None else 0.5
+            matching_model = Member2MatchingModelAdapter(
+                fg_path=fg_path,
+                model_path=model_path,
+                threshold_path=threshold_path if os.path.exists(threshold_path) else None,
+                threshold=th
+            )
+            print(f"[INFO] Loaded Member 2 model ({os.path.basename(model_path)}) and feature generator.")
+        else:
+            print("[INFO] Model artifacts not found under models/. Using PlaceholderMatchingModel.")
+            matching_model = PlaceholderMatchingModel()
+
+        run_pipeline(
+            test_dir=args.test_dir,
+            output_dir=args.output_dir,
+            candidate_generator=candidate_gen,
+            matching_model=matching_model,
+            validate=True,
+            check_ids=args.check_ids
+        )
+
+    elif args.mode == "train":
+        print("To train Member 2's models on generated candidates, run:")
+        print("  python -m src.train --candidate_pairs output/candidate_pairs.tsv ...")
+
+
+if __name__ == "__main__":
+    main()
